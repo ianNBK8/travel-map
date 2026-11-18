@@ -301,7 +301,7 @@ dialog::backdrop { background: rgba(10, 20, 24, .45); }
     <div id="map"></div>
     <div class="searchbox">
       <form class="sbar" id="searchForm">
-        <input id="q" type="search" placeholder="搜尋地點、景點、餐廳…" autocomplete="off" aria-label="搜尋地點">
+        <input id="q" type="search" placeholder="搜尋景點、店家、公司、地址…" autocomplete="off" aria-label="搜尋地點">
         <button type="submit">搜尋</button>
       </form>
       <div class="chips" id="chips"></div>
@@ -578,15 +578,78 @@ function locate(fly, quiet) {
 }
 $('#btnLocate').onclick = () => locate(true, false);
 
-/* ================= 搜尋 (OpenStreetMap Nominatim) ================= */
-async function geosearch(q) {
+/* ================= 搜尋 =================
+   兩個免金鑰來源並行查詢：
+   - ArcGIS 地理編碼：公司、店家、門牌地址（台灣資料較完整，例如「達發科技」）
+   - OpenStreetMap Nominatim：景點、車站、自然地標
+   另外支援貼上座標或 Google 地圖網址。 */
+const ARC = 'https://geocode.arcgis.com/arcgis/rest/services/World/GeocodeServer';
+const enc = encodeURIComponent;
+const near = () => { const c = map.getCenter(); return `${c.lng.toFixed(5)},${c.lat.toFixed(5)}`; };
+
+function parseCoords(q) {
+  const pats = [/!3d(-?\d+\.\d+)!4d(-?\d+\.\d+)/, /@(-?\d+\.\d+),(-?\d+\.\d+)/,
+    /[?&](?:q|query|ll|destination|center)=(-?\d+\.\d+)(?:,|%2C)\s*(-?\d+\.\d+)/i, /^\s*(-?\d{1,2}\.\d+)\s*[, ]\s*(-?\d{1,3}\.\d+)\s*$/];
+  for (const re of pats) {
+    const m = q.match(re);
+    if (m) { const lat = +m[1], lng = +m[2]; if (Math.abs(lat) <= 90 && Math.abs(lng) <= 180) {
+      const nm = q.match(/\/place\/([^/@?]+)/); return { lat, lng, name: nm ? decodeURIComponent(nm[1].replace(/\+/g, ' ')) : '' };
+    } }
+  }
+  return null;
+}
+const isShortGLink = q => /(maps\.app\.goo\.gl|goo\.gl\/maps)/i.test(q);
+
+function arcResult(cd, text) {
+  const a = cd.attributes || {};
+  const title = a.PlaceName || cd.address;
+  let addr = '';
+  if (text && a.PlaceName && text.includes(a.PlaceName)) addr = text.replace(a.PlaceName, '').replace(/,\s*\d{3,6}\s*$/, '').replace(/[,\s]+$/, '').trim();
+  if (!addr) addr = a.Place_addr || (cd.address !== title ? cd.address : '');
+  return { title, addr, lat: cd.location.y, lng: cd.location.x, src: 'arc' };
+}
+async function arcSuggest(q, max = 6) {
+  const r = await fetch(`${ARC}/suggest?f=json&text=${enc(q)}&maxSuggestions=${max}&location=${near()}&langCode=ZH_TW`);
+  if (!r.ok) throw new Error(r.status);
+  return (await r.json()).suggestions || [];
+}
+async function arcResolve(sg) {
+  const r = await fetch(`${ARC}/findAddressCandidates?f=json&SingleLine=${enc(sg.text)}&magicKey=${enc(sg.magicKey)}&outFields=PlaceName,Place_addr,Type&langCode=ZH_TW&location=${near()}&maxLocations=${sg.isCollection ? 6 : 1}`);
+  if (!r.ok) throw new Error(r.status);
+  return ((await r.json()).candidates || []).map(cd => arcResult(cd, sg.isCollection ? '' : sg.text));
+}
+async function arcSearch(q) {
+  const sgs = await arcSuggest(q);
+  const lists = await Promise.all(sgs.map(sg => arcResolve(sg).catch(() => [])));
+  return lists.flat();
+}
+async function osmSearch(q) {
   const b = map.getBounds();
   const vb = `${b.getWest()},${b.getNorth()},${b.getEast()},${b.getSouth()}`;
-  const url = `https://nominatim.openstreetmap.org/search?format=jsonv2&addressdetails=0&limit=8&accept-language=zh-TW,zh,en&viewbox=${vb}&q=${encodeURIComponent(q)}`;
-  const r = await fetch(url); if (!r.ok) throw new Error(r.status);
-  return (await r.json()).map(x => ({
-    title: x.name || x.display_name.split(',')[0], addr: x.display_name, lat: +x.lat, lng: +x.lon,
-  }));
+  const r = await fetch(`https://nominatim.openstreetmap.org/search?format=jsonv2&addressdetails=0&limit=6&accept-language=zh-TW,zh,en&viewbox=${vb}&q=${enc(q)}`);
+  if (!r.ok) throw new Error(r.status);
+  return (await r.json()).map(x => ({ title: x.name || x.display_name.split(',')[0], addr: x.display_name, lat: +x.lat, lng: +x.lon, src: 'osm' }));
+}
+async function geosearch(q) {
+  const c = parseCoords(q);
+  if (c) { const info = await reverse(c.lat, c.lng); return [{ title: c.name || info.name, addr: info.addr, lat: c.lat, lng: c.lng }]; }
+  if (isShortGLink(q)) throw Object.assign(new Error('short'), { short: true });
+  const [a, o] = await Promise.allSettled([arcSearch(q), osmSearch(q)]);
+  if (a.status === 'rejected' && o.status === 'rejected') throw a.reason;
+  const arc = a.value || [];
+  // OSM 的模糊比對常回傳不相關地點：ArcGIS 有結果時，只保留名稱含有關鍵字的 OSM 結果
+  const toks = q.toLowerCase().split(/\s+/).filter(t => t.length >= 2);
+  const relevant = r => { const t = `${r.title} ${r.addr}`.toLowerCase(); return toks.length ? toks.some(k => t.includes(k)) : t.includes(q.toLowerCase()); };
+  const osm = (o.value || []).filter(r => !arc.length || relevant(r));
+  const out = [];
+  for (const r of [...arc, ...osm]) {
+    if (out.some(x => dist(x, r) < 0.06)) continue; // 60 公尺內視為同一地點
+    out.push(r);
+  }
+  // 地圖目前範圍附近（50 公里內）的結果排前面，其餘維持原順序
+  const mc = map.getCenter(), ctr = { lat: mc.lat, lng: mc.lng };
+  const isNear = r => dist(ctr, r) < 50;
+  return [...out.filter(isNear).sort((x, y) => dist(ctr, x) - dist(ctr, y)), ...out.filter(r => !isNear(r))].slice(0, 10);
 }
 async function reverse(lat, lng) {
   try {
@@ -595,33 +658,70 @@ async function reverse(lat, lng) {
     return { name: x.name || (x.display_name || '').split(',')[0] || '地圖上的地點', addr: x.display_name || '' };
   } catch (e) { return { name: '地圖上的地點', addr: `${lat.toFixed(5)}, ${lng.toFixed(5)}` }; }
 }
-function renderResults(box, list, onPick, onAdd) {
+const searchErr = err => err && err.short
+  ? '這是 Google 地圖短網址，無法直接讀取。請先用瀏覽器打開它，再複製網址列的完整網址貼上'
+  : '搜尋失敗，請檢查網路後再試';
+// 結果可能只是建議（還沒有座標），點選時才去取座標
+async function ensureLoc(r) {
+  if (hasLoc(r)) return r;
+  const list = await r.resolve();
+  if (!list.length) throw new Error('none');
+  return list[0];
+}
+function renderResults(box, list, onPick, onAdd, q) {
   box.hidden = false;
-  if (!list.length) { box.innerHTML = '<div class="res"><div class="rtxt"><small>找不到結果，換個關鍵字，或試試 Google 地圖</small></div></div>'; return; }
-  box.innerHTML = list.map((r, n) => `<div class="res" data-n="${n}"><div class="rtxt"><b>${esc(r.title)}</b><small>${esc(r.addr)}</small></div>${onAdd ? '<button class="btn primary" data-add>加入</button>' : ''}</div>`).join('');
-  box.querySelectorAll('.res').forEach(el => {
+  const gLink = q ? `<div class="res"><div class="rtxt"><small>${list.length ? '沒看到想要的？' : '找不到結果。'}<a href="https://www.google.com/maps/search/${enc(q)}" target="_blank" rel="noopener">在 Google 地圖搜尋「${esc(q)}」</a>，找到後可把網址貼回這裡</small></div></div>` : '';
+  if (!list.length) { box.innerHTML = gLink || '<div class="res"><div class="rtxt"><small>找不到結果，換個關鍵字試試</small></div></div>'; return; }
+  box.innerHTML = list.map((r, n) => `<div class="res" data-n="${n}"><div class="rtxt"><b>${esc(r.title)}</b>${r.addr ? `<small>${esc(r.addr)}</small>` : ''}</div>${onAdd ? '<button class="btn primary" data-add>加入</button>' : ''}</div>`).join('') + gLink;
+  box.querySelectorAll('.res[data-n]').forEach(el => {
     const r = list[+el.dataset.n];
-    el.querySelector('.rtxt').onclick = () => onPick(r);
-    el.querySelector('[data-add]')?.addEventListener('click', () => onAdd(r));
+    const run = fn => async () => {
+      try { fn(await ensureLoc(r)); } catch (e) { toast('取得這個地點的位置失敗，請再試一次'); }
+    };
+    el.querySelector('.rtxt').onclick = run(onPick);
+    el.querySelector('[data-add]')?.addEventListener('click', run(onAdd));
   });
 }
+function pickOnMap(r) {
+  $('#results').hidden = true;
+  if (tempMarker) map.removeLayer(tempMarker);
+  tempMarker = L.marker([r.lat, r.lng], { icon: L.divIcon({ className: '', html: `<div class="pin" style="--c:#5b6d74"><span>+</span></div>`, iconSize: [30, 30], iconAnchor: [15, 30], popupAnchor: [0, -28] }) }).addTo(map);
+  map.flyTo([r.lat, r.lng], 16, { duration: .6 });
+  showAddPopup(tempMarker, r);
+}
+function addFromSearch(r) { $('#results').hidden = true; addItem(r); map.flyTo([r.lat, r.lng], 15, { duration: .6 }); }
+
+let sugTimer = null, sugSeq = 0;
 $('#searchForm').onsubmit = async e => {
   e.preventDefault();
+  clearTimeout(sugTimer); const seq = ++sugSeq;
   const q = $('#q').value.trim(); if (!q) return;
   const box = $('#results'); box.hidden = false; box.innerHTML = '<div class="res"><small>搜尋中…</small></div>';
   try {
     const list = await geosearch(q);
-    renderResults(box, list, r => {
-      box.hidden = true;
-      if (tempMarker) map.removeLayer(tempMarker);
-      tempMarker = L.marker([r.lat, r.lng], { icon: L.divIcon({ className: '', html: `<div class="pin" style="--c:#5b6d74"><span>+</span></div>`, iconSize: [30, 30], iconAnchor: [15, 30], popupAnchor: [0, -28] }) }).addTo(map);
-      map.flyTo([r.lat, r.lng], 16, { duration: .6 });
-      showAddPopup(tempMarker, r);
-    }, r => { box.hidden = true; addItem(r); map.flyTo([r.lat, r.lng], 15, { duration: .6 }); });
-    if (list.length) box.insertAdjacentHTML('beforeend', `<div class="res"><div class="rtxt"><small>沒看到想要的？<a href="https://www.google.com/maps/search/${encodeURIComponent(q)}" target="_blank" rel="noopener">在 Google 地圖搜尋「${esc(q)}」</a></small></div></div>`);
-  } catch (err) { box.innerHTML = '<div class="res"><small>搜尋失敗，請檢查網路後再試</small></div>'; }
+    if (seq !== sugSeq) return;
+    if (list.length === 1 && parseCoords(q)) { pickOnMap(list[0]); return; }
+    renderResults(box, list, pickOnMap, addFromSearch, q);
+  } catch (err) { if (seq === sugSeq) box.innerHTML = `<div class="res"><small>${esc(searchErr(err))}</small></div>`; }
 };
-$('#q').addEventListener('input', () => { if (!$('#q').value) $('#results').hidden = true; });
+// 邊打字邊顯示建議
+$('#q').addEventListener('input', () => {
+  clearTimeout(sugTimer);
+  const q = $('#q').value.trim();
+  if (!q) { sugSeq++; $('#results').hidden = true; return; }
+  if (q.length < 2 || parseCoords(q) || isShortGLink(q)) return;
+  sugTimer = setTimeout(async () => {
+    const seq = ++sugSeq;
+    try {
+      const sgs = await arcSuggest(q, 6);
+      if (seq !== sugSeq || $('#q').value.trim() !== q) return;
+      const list = sgs.map(sg => ({ title: sg.text.replace(/,\s*\d{3,6}\s*$/, ''), addr: sg.isCollection ? '附近的同類地點' : '', resolve: () => arcResolve(sg) }));
+      if (!list.length) { $('#results').hidden = true; return; }
+      renderResults($('#results'), list, r => pickOnMap(r), r => addFromSearch(r));
+      $('#results').insertAdjacentHTML('beforeend', '<div class="res"><div class="rtxt"><small>按「搜尋」看更多結果（含景點、車站）</small></div></div>');
+    } catch (e) {}
+  }, 350);
+});
 document.addEventListener('keydown', e => { if (e.key === 'Escape') { $('#results').hidden = true; if (pickCb) $('#pickCancel').click(); } });
 
 /* 一鍵搜尋附近（開 Google 地圖） */
@@ -836,7 +936,7 @@ $('#fLocGo').onclick = async () => {
       editing.loc = { lat: r.lat, lng: r.lng, addr: r.addr }; box.hidden = true; setLocCur();
       if (!$('#fTitle').value.trim()) $('#fTitle').value = r.title;
     });
-  } catch (e) { box.innerHTML = '<div class="res"><small>搜尋失敗，請檢查網路</small></div>'; }
+  } catch (e) { box.innerHTML = `<div class="res"><small>${esc(searchErr(e))}</small></div>`; }
 };
 $('#fLocQ').addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); $('#fLocGo').click(); } });
 $('#fPick').onclick = () => {
